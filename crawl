@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+
+import os
+import requests
+import csv
+import json
+import argparse
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+# Constants
+FLICKR_API_KEY = '1fd3d9438363e4f923179502602e288a'
+FLICKR_API_SECRET = '0402bad0dbb97a14'
+FLICKR_API_ENDPOINT = 'https://api.flickr.com/services/rest/'
+
+# Function to search Flickr images based on keyword and age
+def search_images(keyword, min_upload_date, limit):
+    params = {
+        'method': 'flickr.photos.search',
+        'api_key': FLICKR_API_KEY,
+        'text': keyword,
+        'min_upload_date': min_upload_date,
+        'per_page': limit,
+        'format': 'json',
+        'nojsoncallback': 1
+    }
+    response = requests.get(FLICKR_API_ENDPOINT, params=params)
+    data = response.json()
+    photos = data['photos']['photo']
+    return photos
+
+# Function to download an image
+def download_image(photo, keyword, index, download_dir):
+    url = f"https://farm{photo['farm']}.staticflickr.com/{photo['server']}/{photo['id']}_{photo['secret']}.jpg"
+    response = requests.get(url)
+    file_path = os.path.join(download_dir, f"{keyword}_{index}.jpg")
+    with open(file_path, 'wb') as file:
+        file.write(response.content)
+    return {"url": url, "keyword": keyword, "index": index}
+
+# Main function to handle the command-line interface
+def main():
+    parser = argparse.ArgumentParser(description='Flickr Image Downloader')
+    parser.add_argument('csv_keyword_list', type=str, help='CSV file with list of keywords')
+    parser.add_argument('age', type=str, help='Oldest upload time (YYYY-MM-DD format)')
+    parser.add_argument('limit', type=int, help='Total number of images to download')
+    parser.add_argument('parallel', type=int, nargs='?', default=1, help='Number of parallel downloads')
+    
+    args = parser.parse_args()
+    
+    # Prepare download directory
+    download_dir = 'download'
+    if not os.path.exists(download_dir):
+        os.makedirs(download_dir)
+    
+    # Parse the CSV keyword list
+    with open(args.csv_keyword_list, 'r') as file:
+        reader = csv.reader(file)
+        keywords = list(reader)[0]
+    
+    # Convert age to timestamp
+    min_upload_date = int(datetime.strptime(args.age, "%Y-%m-%d").timestamp())
+    
+    # Initialize JSON data
+    index_data = {"images": []}
+    
+    # Calculate the number of images to download per keyword
+    images_per_keyword = args.limit // len(keywords)
+    remaining_images = args.limit % len(keywords)
+    
+    # Use ThreadPoolExecutor for parallel downloads
+    with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+        futures = []
+        image_count = 0
+        
+        for keyword in keywords:
+            limit_for_this_keyword = images_per_keyword
+            if remaining_images > 0:
+                limit_for_this_keyword += 1
+                remaining_images -= 1
+
+            if limit_for_this_keyword > 0:
+                photos = search_images(keyword, min_upload_date, limit_for_this_keyword)
+                for i, photo in enumerate(photos):
+                    if image_count < args.limit:
+                        future = executor.submit(download_image, photo, keyword, image_count, download_dir)
+                        futures.append(future)
+                        image_count += 1
+        
+        for future in futures:
+            result = future.result()
+            index_data['images'].append(result)
+    
+    # Save index.json
+    with open(os.path.join(download_dir, 'index.json'), 'w') as json_file:
+        json.dump(index_data, json_file, indent=4)
+    
+    print(f"Downloaded {len(index_data['images'])} images and metadata saved to {download_dir}")
+
+if __name__ == "__main__":
+    main()
