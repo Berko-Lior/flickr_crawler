@@ -7,14 +7,31 @@ import json
 import argparse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+import logging
 
-# Constants
+# Configure logging to show debug information
+logging.basicConfig(level=logging.DEBUG)
+
+# Constants for Flickr API access
 FLICKR_API_KEY = '1fd3d9438363e4f923179502602e288a'
 FLICKR_API_SECRET = '0402bad0dbb97a14'
 FLICKR_API_ENDPOINT = 'https://api.flickr.com/services/rest/'
 
-# Function to search Flickr images based on keyword and age
 def search_images(keyword, min_upload_date, limit):
+    """
+    Searches for images on Flickr based on a keyword and a minimum upload date.
+
+    Args:
+        keyword (str): The search keyword to use for finding images.
+        min_upload_date (int): The minimum upload date (in Unix timestamp) for images.
+        limit (int): The maximum number of images to retrieve.
+
+    Returns:
+        list: A list of photo metadata dictionaries returned by the Flickr API.
+    """
+    logging.debug(f"Searching images for keyword: {keyword}, min_upload_date: {min_upload_date}, limit: {limit}")
+    
+    # Parameters for the Flickr API request
     params = {
         'method': 'flickr.photos.search',
         'api_key': FLICKR_API_KEY,
@@ -22,80 +39,127 @@ def search_images(keyword, min_upload_date, limit):
         'min_upload_date': min_upload_date,
         'per_page': limit,
         'format': 'json',
-        'nojsoncallback': 1
+        'nojsoncallback': 1  # Ensures the response is in JSON format
     }
+    
+    # Send a GET request to the Flickr API
     response = requests.get(FLICKR_API_ENDPOINT, params=params)
+    
+    # Log the raw API response for debugging purposes
+    logging.debug(f"API Response: {response.json()}")
+    
+    # Extract the list of photos from the response
     data = response.json()
     photos = data['photos']['photo']
+    
     return photos
 
-# Function to download an image
 def download_image(photo, keyword, index, download_dir):
+    """
+    Downloads an image from Flickr based on the provided photo metadata.
+
+    Args:
+        photo (dict): Metadata for the photo retrieved from the Flickr API.
+        keyword (str): The keyword used to search for the image.
+        index (int): The index of the image in the download sequence.
+        download_dir (str): The directory where the image will be saved.
+
+    Returns:
+        dict: A dictionary containing the image URL, the associated keyword, and the index.
+    """
+    # Construct the URL to download the image from Flickr
     url = f"https://farm{photo['farm']}.staticflickr.com/{photo['server']}/{photo['id']}_{photo['secret']}.jpg"
+    logging.debug(f"Downloading image from {url} for keyword: {keyword}")
+    
+    # Send a GET request to download the image
     response = requests.get(url)
+    
+    # Define the file path where the image will be saved
     file_path = os.path.join(download_dir, f"{keyword}_{index}.jpg")
+    
+    # Save the image content to a file
     with open(file_path, 'wb') as file:
         file.write(response.content)
+    
+    # Return the metadata to be stored in the index.json file
     return {"url": url, "keyword": keyword, "index": index}
 
-# Main function to handle the command-line interface
 def main():
+    """
+    The main function that orchestrates the downloading of images based on user input.
+
+    It reads command-line arguments, searches for images on Flickr based on keywords
+    and a specified date, downloads the images, and creates an index.json file to 
+    store metadata about the downloaded images.
+    """
+    # Set up argument parsing for command-line input
     parser = argparse.ArgumentParser(description='Flickr Image Downloader')
     parser.add_argument('csv_keyword_list', type=str, help='CSV file with list of keywords')
     parser.add_argument('age', type=str, help='Oldest upload time (YYYY-MM-DD format)')
     parser.add_argument('limit', type=int, help='Total number of images to download')
     parser.add_argument('parallel', type=int, nargs='?', default=1, help='Number of parallel downloads')
     
+    # Parse the command-line arguments
     args = parser.parse_args()
+    logging.debug(f"Arguments received: {args}")
     
-    # Prepare download directory
+    # Prepare the download directory, creating it if it doesn't exist
     download_dir = 'download'
     if not os.path.exists(download_dir):
         os.makedirs(download_dir)
     
-    # Parse the CSV keyword list
+    # Read keywords from the provided CSV file
     with open(args.csv_keyword_list, 'r') as file:
         reader = csv.reader(file)
         keywords = list(reader)[0]
+        logging.debug(f"Keywords extracted: {keywords}")
     
-    # Convert age to timestamp
+    # Convert the provided age (in YYYY-MM-DD format) to a Unix timestamp
     min_upload_date = int(datetime.strptime(args.age, "%Y-%m-%d").timestamp())
+    logging.debug(f"Converted age to timestamp: {min_upload_date}")
     
-    # Initialize JSON data
+    # Initialize a dictionary to hold the metadata for downloaded images
     index_data = {"images": []}
     
-    # Calculate the number of images to download per keyword
+    # Determine how many images to download per keyword
     images_per_keyword = args.limit // len(keywords)
-    remaining_images = args.limit % len(keywords)
-    
-    # Use ThreadPoolExecutor for parallel downloads
+    remaining_images = args.limit % len(keywords)  # Handle any leftover images
+
+    # Use a ThreadPoolExecutor to download images in parallel
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         futures = []
         image_count = 0
         
+        # Loop over each keyword to search and download images
         for keyword in keywords:
             limit_for_this_keyword = images_per_keyword
             if remaining_images > 0:
                 limit_for_this_keyword += 1
                 remaining_images -= 1
-
+            
+            logging.debug(f"Keyword: {keyword}, Limit for this keyword: {limit_for_this_keyword}")
+            
             if limit_for_this_keyword > 0:
+                # Search for images on Flickr based on the current keyword
                 photos = search_images(keyword, min_upload_date, limit_for_this_keyword)
+                
+                # Loop over the found photos and submit download tasks to the executor
                 for i, photo in enumerate(photos):
                     if image_count < args.limit:
                         future = executor.submit(download_image, photo, keyword, image_count, download_dir)
                         futures.append(future)
                         image_count += 1
         
+        # Collect the results from the futures (download tasks)
         for future in futures:
             result = future.result()
             index_data['images'].append(result)
     
-    # Save index.json
+    # Save the image metadata to index.json in the download directory
     with open(os.path.join(download_dir, 'index.json'), 'w') as json_file:
         json.dump(index_data, json_file, indent=4)
     
-    print(f"Downloaded {len(index_data['images'])} images and metadata saved to {download_dir}")
+    logging.debug(f"Downloaded {len(index_data['images'])} images and metadata saved to {download_dir}")
 
 if __name__ == "__main__":
     main()
