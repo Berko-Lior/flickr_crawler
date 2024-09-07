@@ -8,6 +8,7 @@ import argparse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import logging
+import shutil
 
 # Configure logging to show debug information
 logging.basicConfig(level=logging.DEBUG)
@@ -16,6 +17,7 @@ logging.basicConfig(level=logging.DEBUG)
 FLICKR_API_KEY = '1fd3d9438363e4f923179502602e288a'
 FLICKR_API_SECRET = '0402bad0dbb97a14'
 FLICKR_API_ENDPOINT = 'https://api.flickr.com/services/rest/'
+MAX_IMAGES_PER_PAGE = 500
 
 def search_images(keyword, min_upload_date, limit):
     """
@@ -30,27 +32,59 @@ def search_images(keyword, min_upload_date, limit):
         list: A list of photo metadata dictionaries returned by the Flickr API.
     """
     logging.debug(f"Searching images for keyword: {keyword}, min_upload_date: {min_upload_date}, limit: {limit}")
+
+    num_of_pages = limit // MAX_IMAGES_PER_PAGE
+
+    photos = []
+    print(f"num_of_pages : {num_of_pages}")
     
-    # Parameters for the Flickr API request
-    params = {
-        'method': 'flickr.photos.search',
-        'api_key': FLICKR_API_KEY,
-        'text': keyword,
-        'min_upload_date': min_upload_date,
-        'per_page': limit,
-        'format': 'json',
-        'nojsoncallback': 1  # Ensures the response is in JSON format
-    }
-    
-    # Send a GET request to the Flickr API
-    response = requests.get(FLICKR_API_ENDPOINT, params=params)
-    
-    # Log the raw API response for debugging purposes
-    logging.debug(f"API Response: {response.json()}")
-    
-    # Extract the list of photos from the response
-    data = response.json()
-    photos = data['photos']['photo']
+    for i in range(num_of_pages):
+        # Parameters for the Flickr API request
+        params = {
+            'method': 'flickr.photos.search',
+            'api_key': FLICKR_API_KEY,
+            'text': keyword,
+            'min_upload_date': min_upload_date,
+            'per_page': limit,
+            'page' : i,
+            'format': 'json',
+            'nojsoncallback': 1  # Ensures the response is in JSON format
+        }
+        
+        # Send a GET request to the Flickr API
+        response = requests.get(FLICKR_API_ENDPOINT, params=params)
+        
+        # Log the raw API response for debugging purposes
+        logging.debug(f"API Response: {response.json()}")
+        
+        # Extract the list of photos from the response
+        data = response.json()
+        photos += data['photos']['photo']
+
+    if limit % MAX_IMAGES_PER_PAGE > 0:
+        # Parameters for the Flickr API request
+        params = {
+            'method': 'flickr.photos.search',
+            'api_key': FLICKR_API_KEY,
+            'text': keyword,
+            'min_upload_date': min_upload_date,
+            'per_page': limit % MAX_IMAGES_PER_PAGE,
+            'page' : limit // MAX_IMAGES_PER_PAGE + 1,
+            'format': 'json',
+            'nojsoncallback': 1  # Ensures the response is in JSON format
+        }
+        
+        # Send a GET request to the Flickr API
+        response = requests.get(FLICKR_API_ENDPOINT, params=params)
+        
+        # Log the raw API response for debugging purposes
+        logging.debug(f"API Response: {response.json()}")
+        
+        # Extract the list of photos from the response
+        data = response.json()
+        photos += data['photos']['photo']
+
+    print(f'photos : {photos}')
     
     return photos
 
@@ -71,18 +105,25 @@ def download_image(photo, keyword, index, download_dir):
     url = f"https://farm{photo['farm']}.staticflickr.com/{photo['server']}/{photo['id']}_{photo['secret']}.jpg"
     logging.debug(f"Downloading image from {url} for keyword: {keyword}")
     
+    
     # Send a GET request to download the image
-    response = requests.get(url)
-    
-    # Define the file path where the image will be saved
-    file_path = os.path.join(download_dir, f"{keyword}_{index}.jpg")
-    
-    # Save the image content to a file
-    with open(file_path, 'wb') as file:
-        file.write(response.content)
-    
-    # Return the metadata to be stored in the index.json file
-    return {"url": url, "keyword": keyword, "index": index}
+    response = None
+
+    try:
+        response = requests.get(url)
+    finally:
+        if not response or not response.ok:
+            return None
+        
+        # Define the file path where the image will be saved
+        file_path = os.path.join(download_dir, f"{keyword}_{index}.jpg")
+        
+        # Save the image content to a file
+        with open(file_path, 'wb') as file:
+            file.write(response.content)
+        
+        # Return the metadata to be stored in the index.json file
+        return {"url": url, "keyword": keyword, "index": index}
 
 def main():
     """
@@ -105,13 +146,26 @@ def main():
     
     # Prepare the download directory, creating it if it doesn't exist
     download_dir = 'download'
-    if not os.path.exists(download_dir):
-        os.makedirs(download_dir)
+    if os.path.exists(download_dir):
+        try:
+            shutil.rmtree(download_dir)
+            print(f"Directory {download_dir} and all its contents have been deleted.")
+        except FileNotFoundError:
+            print("The directory does not exist.")
+        except PermissionError:
+            print("You do not have the necessary permissions to delete this directory.")
+        except Exception as e:
+            print(f"An error occurred: {e}")
+    
+    os.makedirs(download_dir)
     
     # Read keywords from the provided CSV file
+    keywords = []
     with open(args.csv_keyword_list, 'r') as file:
         reader = csv.reader(file)
-        keywords = list(reader)[0]
+        for row in list(reader):
+            keywords += row
+
         logging.debug(f"Keywords extracted: {keywords}")
     
     # Convert the provided age (in YYYY-MM-DD format) to a Unix timestamp
@@ -147,8 +201,9 @@ def main():
                 for i, photo in enumerate(photos):
                     if image_count < args.limit:
                         future = executor.submit(download_image, photo, keyword, image_count, download_dir)
-                        futures.append(future)
-                        image_count += 1
+
+                        if future:
+                            futures.append(future)
         
         # Collect the results from the futures (download tasks)
         for future in futures:
